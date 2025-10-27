@@ -1,25 +1,58 @@
 import graphene
+from graphene import relay
 from graphene_django.types import DjangoObjectType
 from graphene.types import InputObjectType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from .models import Customer, Product, Order
+from django.core.validators import RegexValidator
+from graphene_django.filter import DjangoFilterConnectionField
+from .filters import CustomerFilter, ProductFilter, OrderFilter
+
+# Define a custom Phone Validator for the argument 
+phone_validator = RegexValidator(
+    regex=r'^\+?1?\d{9,15}$', # Simple regex for common international format
+    message="Phone number must be entered in the format: '+999999999'. Up to 15 digits allowed."
+)
 
 # Define the types that mutations will return
 class CustomerType(DjangoObjectType):
     class Meta:
         model = Customer
         field = ("id", "name", "email", "phone", "created_at")
+        interfaces = (relay.Node,) 
+        filter_fields = ()
+        # connection_class = CustomerConnection
 
 class ProductType(DjangoObjectType):
     class Meta:
         model = Product
         fields = ("id", "name", "price", "stock")
+        interfaces = (relay.Node,) 
+        filter_fields = ()
+        # connection_class = ProductConnection
+
 
 class OrderType(DjangoObjectType):
     class Meta:
         model = Order
         fields = ("id", "customer", "products", "total_amount","order_date")
+        interfaces = (relay.Node,) 
+        filter_fields = ()
+        # connection_class = OrderConnection
+
+class CustomerConnection(relay.Connection):
+    class Meta:
+        # Reference the *string* name of the node type
+        node = CustomerType
+
+class ProductConnection(relay.Connection):
+    class Meta:
+        node = ProductType
+
+class OrderConnection(relay.Connection):
+    class Meta:
+        node = OrderType
 
 # --- 2. INPUT TYPES (For complex inputs like BulkCreate) ---
 
@@ -41,17 +74,21 @@ class OrderInput(InputObjectType):
     order_date = graphene.DateTime()
 
 # --- 3. MUTATION CLASSES ---
+
 class CreateOrder(graphene.Mutation):
     # Define the output
     order = graphene.Field(OrderType)
     message = graphene.String()
 
     class Arguments:
-        customer_id = graphene.ID(required = True)
-        product_ids = graphene.List(graphene.ID,required = True)
-        order_date = graphene.DateTime()
+        input = OrderInput(required=True)
 
-    def mutate(root, info, customer_id, product_ids, order_date=None):
+    def mutate(root, info, input=None):
+
+        customer_id = input.customer_id
+        product_ids = input.product_ids
+        order_date = input.order_date
+
         # 1. Input Validation and Fetching
         try:
             # Check if customer exists
@@ -138,7 +175,15 @@ class CreateCustomer(graphene.Mutation):
         if Customer.objects.filter(email=email).exists():
             # 2. Handle Error: Return the message and a null customer
             return CreateCustomer(customer=None, message=f"Error: Customer with email {email} already exists.")
-
+        
+        # 2. Add Phone Validation Check here
+        if phone:
+            try:
+                phone_validator(phone)
+            except ValidationError as e:
+                # Return the specific error message from the validator
+                return CreateCustomer(customer=None, message=f"Error: Phone number invalid. Details: {e.message}")
+        
         # 3. Create Object (If unique)
         customer = Customer.objects.create(
             name=name, 
@@ -192,35 +237,35 @@ class BulkCreateCustomers(graphene.Mutation):
         # Return the results
         return BulkCreateCustomers(customers=created_customers, errors=errors)
 
-# --- 4. ROOT MUTATION (Combine all mutations) ---
+# --- 4. APP-LEVEL QUERY CLASS ---
+class Query(graphene.ObjectType):
+    ping = graphene.String() 
+
+    def resolve_ping(root, info):
+        return "CRM GraphQL API is up and running!"
+
+    # All customers query
+    all_customers = DjangoFilterConnectionField(
+        CustomerType,
+        filterset_class = CustomerFilter
+    )
+
+    # All products Query
+    all_products = DjangoFilterConnectionField(
+        ProductType,
+        filterset_class = ProductFilter
+    )
+
+    all_orders = DjangoFilterConnectionField(
+        OrderType,
+        filterset_class = OrderFilter
+    )
+
+
+# --- 5. ROOT MUTATION (Combine all mutations) ---
 
 class Mutation(graphene.ObjectType):
     create_customer = CreateCustomer.Field()
     bulk_create_customers = BulkCreateCustomers.Field()
     create_product = CreateProduct.Field() 
     create_order = CreateOrder.Field()
-
-# --- 5. APP-LEVEL QUERY CLASS ---
-class Query(graphene.ObjectType):
-    ping = graphene.String() 
-
-    def resolve_ping(root, info):
-        return "CRM GraphQL API is up and running!"
-# Client-side Mutations
-# mutation CreateNewCustomer($name: String!, $email: String!, $phone: String ) {
-#     createCustomer(input: {
-#         name: $name,
-#         email: $email,
-#         phone: $phone
-#     }) {
-#         # The output field should be 'customer' (or similar), not 'post'
-#         customer { 
-#             id
-#             name
-#             email
-#             phone
-#             createdAt
-#         }
-#         message # The homework requires a success message output
-#     }
-# }
