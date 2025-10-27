@@ -1,6 +1,7 @@
 import graphene
 from graphene_django.types import DjangoObjectType
-from graphene.types.input import InputObjectType
+from graphene.types import InputObjectType
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from .models import Customer, Product, Order
 
@@ -15,6 +16,11 @@ class ProductType(DjangoObjectType):
         model = Product
         fields = ("id", "name", "price", "stock")
 
+class OrderType(DjangoObjectType):
+    class Meta:
+        model = Order
+        fields = ("id", "customer", "products", "total_amount","order_date")
+
 # --- 2. INPUT TYPES (For complex inputs like BulkCreate) ---
 
 class CustomerInput(InputObjectType):
@@ -23,7 +29,99 @@ class CustomerInput(InputObjectType):
     email = graphene.String(required=True)
     phone = graphene.String()
 
+class OrderInput(InputObjectType):
+    """Input for creating a new Order."""
+    # 1. Foreign Key: Customer ID (must exist!)
+    customer_id = graphene.ID(required=True) 
+    
+    # 2. Many-to-Many: A list of Product IDs
+    product_ids = graphene.List(graphene.ID, required=True)
+    
+    # 3. Optional date
+    order_date = graphene.DateTime()
+
 # --- 3. MUTATION CLASSES ---
+class CreateOrder(graphene.Mutation):
+    # Define the output
+    order = graphene.Field(OrderType)
+    message = graphene.String()
+
+    class Arguments:
+        customer_id = graphene.ID(required = True)
+        product_ids = graphene.List(graphene.ID,required = True)
+        order_date = graphene.DateTime()
+
+    def mutate(root, info, customer_id, product_ids, order_date=None):
+        # 1. Input Validation and Fetching
+        try:
+            # Check if customer exists
+            customer = Customer.objects.get(pk=customer_id)
+        except ObjectDoesNotExist:
+            return CreateOrder(order=None, message=f"Error: Customer ID {customer_id} not found.")
+
+        # Check if products exist and if list is not empty (implicit validation)
+        if not product_ids:
+            return CreateOrder(order=None, message="Error: Order must contain at least one product.")
+        
+        products = Product.objects.filter(id__in=product_ids)
+        
+        # Check if all provided product IDs were valid
+        if products.count() != len(product_ids):
+            # This is complex, but for simplicity, we'll just return a generic error
+            return CreateOrder(order=None, message="Error: One or more product IDs were invalid.")
+
+        # 2. Server-side Calculation of Total Amount
+        # sum() needs the values to be cast to float/decimal for calculation
+        total_amount = sum(product.price for product in products)
+        
+        # 3. Create the Order and Relationships
+        with transaction.atomic():
+            # Create the main Order object
+            order = Order.objects.create(
+                customer=customer,
+                total_amount=total_amount,
+                order_date=order_date # Defaults to now if None
+            )
+            # Save the Many-to-Many relationship
+            order.products.set(products) 
+        
+        # 4. Return Success
+        return CreateOrder(order=order, message="Order created successfully with calculated total.")
+
+class CreateProduct(graphene.Mutation):
+    # define the output
+    product = graphene.Field(ProductType)
+    message = graphene.String()
+
+    class Arguments:
+        name = graphene.String(required=True)
+        price = graphene.Decimal(required= True)
+        stock = graphene.Int()
+
+    def mutate(root, info, name, price, stock=0):
+        # 1. Price Validation (Must be positive)
+        if price <= 0:
+            return CreateProduct(product=None, message="Error: Price must be a positive number.")
+        
+        # 2. Stock Validation (Must be non-negative)
+        if stock < 0:
+            return CreateProduct(product=None, message="Error: Stock cannot be negative.")
+
+        # 3. Create the Product using the Django ORM
+        try:
+            product = Product.objects.create(
+                name=name,
+                price=price,
+                stock=stock
+            )
+            # 4. Return Success
+            return CreateProduct(product=product, message="Product created successfully!")
+        
+        except Exception as e:
+            # Catch any unexpected database or conversion errors
+            return CreateProduct(product=None, message=f"Database Error: {str(e)}")        
+
+
 class CreateCustomer(graphene.Mutation):
     # Define the output
     customer = graphene.Field(CustomerType)
@@ -99,14 +197,15 @@ class BulkCreateCustomers(graphene.Mutation):
 class Mutation(graphene.ObjectType):
     create_customer = CreateCustomer.Field()
     bulk_create_customers = BulkCreateCustomers.Field()
-    # create_product = CreateProduct.Field() # These are next!
-    # create_order = CreateOrder.Field()
-    pass # Remove this when you add more mutations!
+    create_product = CreateProduct.Field() 
+    create_order = CreateOrder.Field()
 
-# The Query class would go here if you needed app-specific queries
+# --- 5. APP-LEVEL QUERY CLASS ---
+class Query(graphene.ObjectType):
+    ping = graphene.String() 
 
-
-
+    def resolve_ping(root, info):
+        return "CRM GraphQL API is up and running!"
 # Client-side Mutations
 # mutation CreateNewCustomer($name: String!, $email: String!, $phone: String ) {
 #     createCustomer(input: {
